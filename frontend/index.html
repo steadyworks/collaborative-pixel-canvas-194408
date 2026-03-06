@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Collaborative Pixel Canvas</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: sans-serif; background: #f0f0f0; padding: 16px; }
+
+    #header {
+      display: flex; align-items: center; gap: 12px;
+      margin-bottom: 14px; font-size: 14px;
+    }
+    #header h1 { font-size: 16px; color: #333; }
+    #user-identifier { font-weight: bold; color: #555; font-size: 13px; }
+
+    #main { display: flex; gap: 20px; align-items: flex-start; }
+
+    #canvas-container { overflow: auto; }
+    #canvas-grid {
+      display: grid;
+      grid-template-columns: repeat(64, 8px);
+      grid-template-rows: repeat(64, 8px);
+      border: 1px solid #aaa;
+      cursor: crosshair;
+      width: 512px;
+      height: 512px;
+    }
+    .pixel {
+      width: 8px;
+      height: 8px;
+      background-color: #FFFFFF;
+      border: 0.5px solid rgba(180,180,180,0.25);
+    }
+    .pixel:hover { outline: 1px solid rgba(0,0,0,0.4); outline-offset: -1px; }
+
+    #sidebar { min-width: 160px; }
+
+    #color-palette {
+      display: flex; flex-wrap: wrap; gap: 3px; width: 114px; /* 4*24 + 3*6px */
+    }
+    .color-swatch {
+      width: 24px; height: 24px;
+      border: 2px solid transparent;
+      cursor: pointer;
+      border-radius: 3px;
+      flex-shrink: 0;
+    }
+    .color-swatch.selected { border-color: #111; box-shadow: 0 0 0 1px #fff inset; }
+    .color-swatch:hover:not(.selected) { border-color: #666; }
+
+    #selected-color-display {
+      width: 36px; height: 36px;
+      border: 2px solid #333;
+      border-radius: 4px;
+      margin-top: 8px;
+    }
+
+    #cooldown-timer {
+      font-size: 22px; font-weight: bold;
+      color: #e50000; margin-top: 8px;
+      display: none; min-width: 30px;
+    }
+
+    #controls { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+    button {
+      padding: 7px 14px; cursor: pointer;
+      border: none; border-radius: 4px;
+      font-size: 13px; font-weight: 600;
+    }
+    #timelapse-btn { background: #0083c7; color: #fff; }
+    #timelapse-btn:hover { background: #006faa; }
+    #timelapse-stop { background: #e50000; color: #fff; display: none; }
+    #timelapse-stop:hover { background: #c00; }
+
+    #pixel-tooltip {
+      position: fixed;
+      background: rgba(20,20,20,0.88);
+      color: #fff;
+      padding: 6px 10px;
+      border-radius: 5px;
+      font-size: 12px;
+      pointer-events: none;
+      z-index: 9999;
+      display: none;
+      white-space: nowrap;
+    }
+    #pixel-tooltip > div { margin: 2px 0; }
+  </style>
+</head>
+<body>
+  <div id="header">
+    <h1>Collaborative Pixel Canvas</h1>
+    <span id="user-identifier" data-testid="user-identifier"></span>
+  </div>
+
+  <div id="main">
+    <div id="canvas-container">
+      <div id="canvas-grid" data-testid="canvas-grid"></div>
+    </div>
+
+    <div id="sidebar">
+      <div id="color-palette" data-testid="color-palette"></div>
+      <div
+        id="selected-color-display"
+        data-testid="selected-color-display"
+        data-color="#FFFFFF"
+      ></div>
+      <div id="cooldown-timer" data-testid="cooldown-timer"></div>
+      <div id="controls">
+        <button id="timelapse-btn" data-testid="timelapse-btn">Timelapse</button>
+        <button id="timelapse-stop" data-testid="timelapse-stop">Stop</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="pixel-tooltip" data-testid="pixel-tooltip">
+    <div data-testid="tooltip-user"></div>
+    <div data-testid="tooltip-timestamp"></div>
+  </div>
+
+  <script>
+    // ---------------------------------------------------------------------------
+    // Config
+    // ---------------------------------------------------------------------------
+    const API_HOST = window.location.hostname || 'localhost';
+    const API_BASE = `http://${API_HOST}:3001`;
+    const WS_URL = `ws://${API_HOST}:3001/ws`;
+
+    const PALETTE = [
+      '#FFFFFF', '#E4E4E4', '#888888', '#222222',
+      '#FFA7D1', '#E50000', '#E59500', '#A06A42',
+      '#E5D900', '#94E044', '#02BE01', '#00D3DD',
+      '#0083C7', '#0000EA', '#CF6EE4', '#820080',
+    ];
+
+    // ---------------------------------------------------------------------------
+    // State
+    // ---------------------------------------------------------------------------
+    let selectedColor = PALETTE[0];
+    let username = '';
+    // Live state: always up-to-date including WS events during timelapse
+    let livePixelState = {};   // "x,y" -> {color, placer, placed_at}
+    // Display state: matches live state normally; timelapse replays into this
+    let pixelState = {};
+
+    let cooldownEndTime = 0;
+    let cooldownIntervalId = null;
+
+    let isTimelapse = false;
+    let timelapseAborted = false;
+
+    // Map for O(1) cell access
+    const pixelCells = {};
+
+    // ---------------------------------------------------------------------------
+    // DOM refs
+    // ---------------------------------------------------------------------------
+    const canvasGrid        = document.getElementById('canvas-grid');
+    const colorPalette      = document.getElementById('color-palette');
+    const selectedColorDisp = document.getElementById('selected-color-display');
+    const cooldownTimerEl   = document.getElementById('cooldown-timer');
+    const timelapseBtnEl    = document.getElementById('timelapse-btn');
+    const timelapseStopEl   = document.getElementById('timelapse-stop');
+    const tooltipEl         = document.getElementById('pixel-tooltip');
+    const tooltipUserEl     = tooltipEl.querySelector('[data-testid="tooltip-user"]');
+    const tooltipTsEl       = tooltipEl.querySelector('[data-testid="tooltip-timestamp"]');
+    const userIdentEl       = document.getElementById('user-identifier');
+
+    // ---------------------------------------------------------------------------
+    // Username
+    // ---------------------------------------------------------------------------
+    function generateUsername() {
+      const bases = ['PixelFox', 'PixelWolf', 'PixelBear', 'PixelOwl', 'PixelCat'];
+      const base = bases[Math.floor(Math.random() * bases.length)];
+      const num = Math.floor(Math.random() * 9000) + 1000;
+      return `${base}-${num}`;
+    }
+
+    function initUsername() {
+      let name = localStorage.getItem('px-canvas-username');
+      if (!name) {
+        name = generateUsername();
+        localStorage.setItem('px-canvas-username', name);
+      }
+      username = name;
+      userIdentEl.textContent = name;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Palette
+    // ---------------------------------------------------------------------------
+    function initPalette() {
+      PALETTE.forEach(color => {
+        const hex = color.slice(1).toLowerCase();
+        const swatch = document.createElement('div');
+        swatch.className = 'color-swatch';
+        swatch.dataset.testid = `color-swatch-${hex}`;
+        swatch.style.backgroundColor = color;
+        swatch.title = color;
+        swatch.addEventListener('click', () => selectColor(color));
+        colorPalette.appendChild(swatch);
+      });
+      selectColor(PALETTE[0]);
+    }
+
+    function selectColor(color) {
+      selectedColor = color;
+      selectedColorDisp.dataset.color = color;
+      selectedColorDisp.style.backgroundColor = color;
+      const targetHex = color.slice(1).toLowerCase();
+      document.querySelectorAll('.color-swatch').forEach(s => {
+        s.classList.toggle('selected', s.dataset.testid === `color-swatch-${targetHex}`);
+      });
+    }
+
+    // ---------------------------------------------------------------------------
+    // Grid
+    // ---------------------------------------------------------------------------
+    function initGrid() {
+      // Build all 4096 cells
+      const frag = document.createDocumentFragment();
+      for (let y = 0; y < 64; y++) {
+        for (let x = 0; x < 64; x++) {
+          const cell = document.createElement('div');
+          cell.className = 'pixel';
+          cell.dataset.testid = `pixel-${x}-${y}`;
+          cell.dataset.x = String(x);
+          cell.dataset.y = String(y);
+          pixelCells[`${x},${y}`] = cell;
+          frag.appendChild(cell);
+        }
+      }
+      canvasGrid.appendChild(frag);
+    }
+
+    function renderPixel(x, y, color) {
+      const cell = pixelCells[`${x},${y}`];
+      if (cell) cell.style.backgroundColor = color;
+    }
+
+    function clearDisplay() {
+      pixelState = {};
+      Object.values(pixelCells).forEach(c => { c.style.backgroundColor = '#FFFFFF'; });
+    }
+
+    // ---------------------------------------------------------------------------
+    // Cooldown
+    // ---------------------------------------------------------------------------
+    function startCooldown() {
+      cooldownEndTime = Date.now() + 5000;
+      updateCooldownDisplay();
+      if (cooldownIntervalId) clearInterval(cooldownIntervalId);
+      cooldownIntervalId = setInterval(() => {
+        updateCooldownDisplay();
+        if (Date.now() >= cooldownEndTime) {
+          clearInterval(cooldownIntervalId);
+          cooldownIntervalId = null;
+        }
+      }, 200);
+    }
+
+    function updateCooldownDisplay() {
+      const remaining = Math.ceil((cooldownEndTime - Date.now()) / 1000);
+      if (remaining <= 0) {
+        cooldownTimerEl.textContent = '';
+        cooldownTimerEl.style.display = 'none';
+      } else {
+        cooldownTimerEl.textContent = String(remaining);
+        cooldownTimerEl.style.display = 'block';
+      }
+    }
+
+    function isCooldownActive() {
+      return Date.now() < cooldownEndTime;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Load canvas
+    // ---------------------------------------------------------------------------
+    async function loadCanvas() {
+      try {
+        const resp = await fetch(`${API_BASE}/api/canvas`);
+        if (!resp.ok) return;
+        const pixels = await resp.json();
+        livePixelState = {};
+        pixelState = {};
+        for (const p of pixels) {
+          const key = `${p.x},${p.y}`;
+          const info = { color: p.color, placer: p.placer, placed_at: p.placed_at };
+          livePixelState[key] = info;
+          pixelState[key] = info;
+          renderPixel(p.x, p.y, p.color);
+        }
+      } catch (err) {
+        console.error('loadCanvas failed:', err);
+      }
+    }
+
+    // ---------------------------------------------------------------------------
+    // WebSocket
+    // ---------------------------------------------------------------------------
+    let ws;
+
+    function connectWS() {
+      try {
+        ws = new WebSocket(WS_URL);
+        ws.onmessage = (event) => {
+          let data;
+          try { data = JSON.parse(event.data); } catch { return; }
+          if (data.type === 'pixel') {
+            const key = `${data.x},${data.y}`;
+            const info = { color: data.color, placer: data.placer, placed_at: data.placed_at };
+            livePixelState[key] = info;
+            if (!isTimelapse) {
+              pixelState[key] = info;
+              renderPixel(data.x, data.y, data.color);
+            }
+          }
+        };
+        ws.onclose = () => setTimeout(connectWS, 1500);
+        ws.onerror = () => { try { ws.close(); } catch {} };
+      } catch {
+        setTimeout(connectWS, 1500);
+      }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Pixel click
+    // ---------------------------------------------------------------------------
+    canvasGrid.addEventListener('click', async (e) => {
+      if (isTimelapse) return;
+      if (isCooldownActive()) return;
+
+      const cell = e.target.closest('.pixel');
+      if (!cell) return;
+
+      const x = parseInt(cell.dataset.x, 10);
+      const y = parseInt(cell.dataset.y, 10);
+      const key = `${x},${y}`;
+      const now = new Date().toISOString();
+
+      // Optimistic update
+      const info = { color: selectedColor, placer: username, placed_at: now };
+      livePixelState[key] = info;
+      pixelState[key] = info;
+      cell.style.backgroundColor = selectedColor;
+      startCooldown();
+
+      // Persist to backend
+      try {
+        const resp = await fetch(`${API_BASE}/api/pixels`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ x, y, color: selectedColor, placer: username }),
+        });
+        if (resp.ok) {
+          const d = await resp.json();
+          const serverInfo = { color: d.color, placer: d.placer, placed_at: d.placed_at };
+          livePixelState[key] = serverInfo;
+          if (!isTimelapse) pixelState[key] = serverInfo;
+        }
+      } catch (err) {
+        console.error('place pixel failed:', err);
+      }
+    });
+
+    // ---------------------------------------------------------------------------
+    // Tooltip
+    // ---------------------------------------------------------------------------
+    function formatRelativeTime(isoString) {
+      try {
+        const date = new Date(isoString);
+        const diffMs = Date.now() - date.getTime();
+        const diffSec = Math.floor(diffMs / 1000);
+        if (diffSec < 5) return 'just now';
+        if (diffSec < 60) return `${diffSec} seconds ago`;
+        if (diffSec < 3600) return `${Math.floor(diffSec / 60)} minutes ago`;
+        if (diffSec < 86400) return `${Math.floor(diffSec / 3600)} hours ago`;
+        return date.toLocaleString();
+      } catch {
+        return isoString || '';
+      }
+    }
+
+    canvasGrid.addEventListener('mouseover', (e) => {
+      const cell = e.target.closest('.pixel');
+      if (!cell) { tooltipEl.style.display = 'none'; return; }
+
+      const x = cell.dataset.x;
+      const y = cell.dataset.y;
+      const data = pixelState[`${x},${y}`];
+
+      if (!data) { tooltipEl.style.display = 'none'; return; }
+
+      tooltipUserEl.textContent = data.placer;
+      tooltipTsEl.textContent = formatRelativeTime(data.placed_at);
+
+      const rect = cell.getBoundingClientRect();
+      tooltipEl.style.left = (rect.right + 6) + 'px';
+      tooltipEl.style.top = rect.top + 'px';
+      tooltipEl.style.display = 'block';
+    });
+
+    canvasGrid.addEventListener('mouseleave', () => {
+      tooltipEl.style.display = 'none';
+    });
+
+    // ---------------------------------------------------------------------------
+    // Timelapse
+    // ---------------------------------------------------------------------------
+    timelapseBtnEl.addEventListener('click', () => {
+      if (!isTimelapse) startTimelapse();
+    });
+
+    timelapseStopEl.addEventListener('click', stopTimelapse);
+
+    async function startTimelapse() {
+      isTimelapse = true;
+      timelapseAborted = false;
+
+      // Show stop immediately (before async fetch so test can see it)
+      timelapseStopEl.style.display = 'block';
+
+      // Clear canvas immediately
+      clearDisplay();
+
+      // Fetch history
+      let history;
+      try {
+        const resp = await fetch(`${API_BASE}/api/history`);
+        history = await resp.json();
+      } catch (err) {
+        console.error('fetch history failed:', err);
+        stopTimelapse();
+        return;
+      }
+
+      if (timelapseAborted) return;
+
+      // Replay history in order
+      let i = 0;
+      function applyNextStep() {
+        if (timelapseAborted) return;
+        if (i >= history.length) {
+          if (!timelapseAborted) stopTimelapse();
+          return;
+        }
+        const entry = history[i++];
+        const key = `${entry.x},${entry.y}`;
+        pixelState[key] = { color: entry.color, placer: entry.placer, placed_at: entry.placed_at };
+        renderPixel(entry.x, entry.y, entry.color);
+        setTimeout(applyNextStep, 100);
+      }
+      applyNextStep();
+    }
+
+    function stopTimelapse() {
+      timelapseAborted = true;
+      isTimelapse = false;
+
+      timelapseStopEl.style.display = 'none';
+
+      // Restore live state
+      Object.values(pixelCells).forEach(c => { c.style.backgroundColor = '#FFFFFF'; });
+      pixelState = {};
+      for (const [key, info] of Object.entries(livePixelState)) {
+        pixelState[key] = info;
+        const [x, y] = key.split(',').map(Number);
+        renderPixel(x, y, info.color);
+      }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Init
+    // ---------------------------------------------------------------------------
+    async function init() {
+      initUsername();
+      initGrid();
+      initPalette();
+      connectWS();
+      await loadCanvas();
+    }
+
+    init();
+  </script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+{
+  "name": "collaborative-pixel-canvas",
+  "version": "1.0.0",
+  "private": true,
+  "devDependencies": {
+    "@playwright/test": "^1.40.0",
+    "@types/node": "^20.0.0"
+  }
+}
